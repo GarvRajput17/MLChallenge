@@ -33,9 +33,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 from sparse_dot_topn import sp_matmul_topn
 
-from common import log
-
-N_THREADS = max(1, (os.cpu_count() or 4))
+from common import THREADS as N_THREADS, log
 QUERY_CHUNK = 400_000
 
 
@@ -65,11 +63,27 @@ def prune_rows(X: sp.csr_matrix, max_nnz: int) -> sp.csr_matrix:
 
 def build_vectors(index_texts, query_texts, *, analyzer, ngram_range,
                   min_df=2, max_df=0.3, max_nnz=24):
+    """max_df is the single most important cost knob for word-token views.
+
+    Sparse-product cost is the sum of document frequencies over the query's terms.
+    Address tokens like `road`, `delhi`, `nagar` occur in a large fraction of records,
+    so they dominate the work while contributing almost nothing to an IDF-weighted
+    cosine. Capping max_df drops exactly those -- the same tokens the induced lexicon
+    independently flags as generic.
+    """
     """Fit the vocabulary/IDF on the index side (S1) and project both sides into it."""
     vec = TfidfVectorizer(analyzer=analyzer, ngram_range=ngram_range,
                           min_df=min_df, max_df=max_df, sublinear_tf=True,
                           dtype=np.float32, norm=None, lowercase=False)
-    D = vec.fit_transform(index_texts)
+    try:
+        D = vec.fit_transform(index_texts)
+    except ValueError:
+        # Every term pruned away by min_df/max_df -- happens when a view is mostly
+        # empty for a country slice (e.g. addresses with no re-used tokens). The
+        # view simply contributes nothing; other channels still cover those records.
+        return None, None
+    if D.shape[1] == 0:
+        return None, None
     Q = vec.transform(query_texts)
     return prune_rows(D, max_nnz), prune_rows(Q, max_nnz)
 
@@ -188,3 +202,34 @@ def pair_cosine(Q: sp.csr_matrix, D: sp.csr_matrix, qi, di, chunk=2_000_000):
         b = D[di[s:e]]
         out[s:e] = np.asarray(a.multiply(b).sum(axis=1)).ravel()
     return out
+
+
+def combine(name_cos, addr_cos, exact_hit, mode="sum"):
+    """Prune-ranking score. Chosen empirically -- see reports/tune.log.
+
+    Measured pair completeness at 12 candidates/entity on the cached India union:
+
+        n + a (sum)        0.9426   <- selected
+        sqrt(n*a)          0.9372
+        max + min + exact  0.9336
+        0.50n + 0.50a      0.9246
+        0.62n + 0.38a      0.8807   <- what run #1 used
+        max(n, a)          0.6869
+
+    Two lessons. Additive agreement across BOTH fields beats keying off the stronger
+    one: a distractor readily matches a common name or a shared street, so the weaker
+    field is the discriminating signal, not noise to be discarded -- which is why
+    max(n,a) comes last. And the old 0.62/0.38 split over-trusted the name, the
+    noisier of the two fields, while over-weighting the exact-match bonus relative to
+    the cosine scale.
+    """
+    if mode == "weighted":
+        return 0.62 * name_cos + 0.38 * addr_cos + 0.20 * exact_hit
+    if mode == "geometric":
+        return (np.sqrt(np.clip(name_cos, 0, None) * np.clip(addr_cos, 0, None))
+                + 0.20 * exact_hit).astype(np.float32)
+    if mode == "robust":
+        hi = np.maximum(name_cos, addr_cos)
+        lo = np.minimum(name_cos, addr_cos)
+        return (hi + 0.5 * lo + 0.25 * exact_hit).astype(np.float32)
+    return (name_cos + addr_cos + 0.20 * exact_hit).astype(np.float32)

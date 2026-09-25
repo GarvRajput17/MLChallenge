@@ -17,8 +17,8 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from blocking import (build_vectors, exact_join, merge_channels, pair_cosine,
-                      prune_per_entity, topk_pairs)
+from blocking import (build_vectors, combine, exact_join, merge_channels,
+                      pair_cosine, prune_per_entity, topk_pairs)
 from common import CACHE, log
 
 CANON_COLS = ["entity_id", "name_c", "name_core", "name_sq", "addr_c", "addr_core"]
@@ -42,61 +42,68 @@ def load_others(split: str, country: str, columns=CANON_COLS) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- channels ---
 class Config:
-    """All retrieval runs with S1 as the *index* and S2/S3 as the *query*.
+    """Retrieval config. S1 is always the index (small side) and S2/S3 the query.
 
-    That orientation matters: S1 is the small side, so the transposed index stays
-    small, and -- because every S2/S3 record has at most one true parent -- a modest
-    top-k already captures nearly all achievable recall. Retrieving in the other
-    direction would mean transposing a 100M-nnz matrix per channel.
-
-    Complementary *views* replace a reverse pass: each view ranks candidates
-    differently, so their union recovers pairs that any single view would crowd out
-    (a name shared by 253 entities cannot be resolved by the name view alone).
+    ER_FAST=1 drops to two views with a tighter feature budget: roughly 3x faster
+    at a few points of recall. Used when wall-clock matters more than the last
+    percent of pair completeness.
     """
-    views = [
-        # (label, field, analyzer, ngram_range, top_k, threshold)
-        ("name_sq",   "name_sq",   "char_wb", (3, 4), 14, 0.32),
-        ("addr",      "addr_c",    "word",    (1, 1), 12, 0.30),
-        ("name_tok",  "name_c",    "word",    (1, 1),  8, 0.42),
-        ("addr_core", "addr_core", "word",    (1, 1),  8, 0.40),
-    ]
-    max_nnz = 28
+    _FAST = os.environ.get("ER_FAST", "0") == "1"
+
+    # (label, field, analyzer, ngram_range, top_k, threshold, max_df)
+    if _FAST:
+        views = [
+            ("name_sq", "name_sq", "char_wb", (3, 4), 10, 0.36, 0.20),
+            ("addr",    "addr_c",  "word",    (1, 1),  8, 0.34, 0.02),
+        ]
+        max_nnz = 16
+        max_per_entity = 8
+    else:
+        views = [
+            ("name_sq",   "name_sq",   "char_wb", (3, 4), 14, 0.32, 0.20),
+            ("addr",      "addr_c",    "word",    (1, 1), 12, 0.30, 0.02),
+            ("name_tok",  "name_c",    "word",    (1, 1),  8, 0.42, 0.05),
+            ("addr_core", "addr_core", "word",    (1, 1),  8, 0.40, 0.02),
+        ]
+        max_nnz = 28
+        max_per_entity = int(os.environ.get("ER_M", 12))
+
+    score_mode = os.environ.get("ER_SCORE", "sum")   # sum | geometric | robust | weighted
     exact_keys = ("name_c", "name_sq", "addr_c")
     exact_bucket = 40
-    max_per_entity = 14      # size of the reported candidate set
-    min_score = 0.26
-    w_name = 0.62
-    w_addr = 0.38
+    min_score = float(os.environ.get('ER_MIN_SCORE', 0.20))
 
 
-def sweep(s1_idx, other_idx, score, n_oth, truth_keys, n_s1, cfg):
-    """Pair completeness vs. candidates-per-entity, so the prune can be tuned against
-    both objectives at once (recall ceiling AND reported candidate-set size)."""
-    keys = s1_idx * np.int64(n_oth) + other_idx
-    pos = np.searchsorted(truth_keys, keys)
-    pos[pos >= len(truth_keys)] = 0
-    is_true = truth_keys[pos] == keys
-    n_truth = len(truth_keys)
-    log(f"   union recall ceiling: {is_true.sum()/max(n_truth,1):.4f} "
-        f"({is_true.sum():,}/{n_truth:,})")
-    log("   m    min_score   pairs/entity   pair completeness")
+def sweep_report(s1_idx, score, is_true, n_s1, cfg, n_truth_total):
+    """Pair completeness vs. candidates-per-entity -- the two graded objectives.
+
+    Completeness is measured against ALL reachable true pairs (n_truth_total), not
+    just those the union happened to retrieve, so the union's own recall ceiling is
+    visible rather than definitionally 1.0.
+    """
+    found = int(is_true.sum())
+    log(f"   union recall ceiling: {found / max(n_truth_total, 1):.4f} "
+        f"({found:,}/{n_truth_total:,})")
+    log("   m    pairs/entity   pair completeness")
     for m in (3, 4, 5, 6, 8, 10, 14):
-        for ms in (0.20, 0.26, 0.32):
-            sel = prune_per_entity(s1_idx, score, m, ms)
-            log(f"   {m:<4} {ms:<11.2f} {len(sel)/max(n_s1,1):<14.2f} "
-                f"{is_true[sel].sum()/max(n_truth,1):.4f}")
+        sel = prune_per_entity(s1_idx, score, m, cfg.min_score)
+        log(f"   {m:<4} {len(sel)/max(n_s1,1):<14.2f} "
+            f"{is_true[sel].sum()/max(n_truth_total,1):.4f}")
 
 
 def block_country(s1: pd.DataFrame, others: pd.DataFrame, cfg=Config,
-                  truth_keys=None):
+                  truth_keys=None, save_union=None):
     n_s1, n_oth = len(s1), len(others)
     log(f"   S1={n_s1:,}  S2+S3={n_oth:,}")
 
     channels, keep_vecs = [], {}
-    for label, field, analyzer, ngram, k, thr in cfg.views:
+    for label, field, analyzer, ngram, k, thr, mxdf in cfg.views:
         D, Q = build_vectors(s1[field].values, others[field].values,
                              analyzer=analyzer, ngram_range=ngram,
-                             max_nnz=cfg.max_nnz)
+                             max_nnz=cfg.max_nnz, max_df=mxdf)
+        if D is None:
+            log(f"   [{label}] empty vocabulary for this slice -- view skipped")
+            continue
         log(f"   [{label}] vectors: S1 nnz={D.nnz:,} others nnz={Q.nnz:,}")
         qi, di, sc = topk_pairs(Q, D, k, thr)
         log(f"   [{label}] {len(qi):,} pairs ({len(qi)/max(n_oth,1):.1f} per record)")
@@ -128,19 +135,39 @@ def block_country(s1: pd.DataFrame, others: pd.DataFrame, cfg=Config,
     # Recompute both principal cosines exactly on the union. Most pairs were found by
     # only one view, so that view's score alone is a biased ranking signal; exact
     # rescoring is what lets the prune cut hard without shedding recall.
-    Qn, Dn = keep_vecs["name_sq"]
-    name_cos = pair_cosine(Qn, Dn, other_idx, s1_idx)
-    del Qn, Dn, keep_vecs["name_sq"]
-    gc.collect()
-    Qa, Da = keep_vecs["addr"]
-    addr_cos = pair_cosine(Qa, Da, other_idx, s1_idx)
-    del Qa, Da, keep_vecs
+    def rescore(key):
+        if key not in keep_vecs:
+            return np.zeros(n_union, dtype=np.float32)
+        Q, D = keep_vecs.pop(key)
+        out = pair_cosine(Q, D, other_idx, s1_idx)
+        del Q, D
+        gc.collect()
+        return out
+
+    name_cos = rescore("name_sq")
+    addr_cos = rescore("addr")
+    del keep_vecs
     gc.collect()
 
-    score = cfg.w_name * name_cos + cfg.w_addr * addr_cos + 0.20 * exact_hit
+    score = combine(name_cos, addr_cos, exact_hit, cfg.score_mode)
 
     if truth_keys is not None:
-        sweep(s1_idx, other_idx, score, n_oth, truth_keys, n_s1, cfg)
+        keys = s1_idx * np.int64(n_oth) + other_idx
+        pos = np.searchsorted(truth_keys, keys)
+        pos[pos >= len(truth_keys)] = 0
+        is_true = truth_keys[pos] == keys
+        del keys, pos
+        if save_union:
+            # Cache the scored union: ranking experiments then cost seconds instead
+            # of re-running retrieval. This is what makes the prune tunable at all.
+            pd.DataFrame({
+                "s1_idx": s1_idx.astype(np.int32),
+                "oth_idx": other_idx.astype(np.int32),
+                "name_cos": name_cos, "addr_cos": addr_cos,
+                "exact_hit": exact_hit, "is_true": is_true,
+            }).to_parquet(save_union, index=False)
+            log(f"   cached union -> {save_union}")
+        sweep_report(s1_idx, score, is_true, n_s1, cfg, len(truth_keys))
 
     sel = prune_per_entity(s1_idx, score, cfg.max_per_entity, cfg.min_score)
     log(f"   pruned: {len(sel):,} pairs ({len(sel)/max(n_s1,1):.2f} per S1 entity, "
@@ -189,6 +216,8 @@ def main():
     ap.add_argument("--split", default="train")
     ap.add_argument("--countries", nargs="*", default=None)
     ap.add_argument("--limit-s1", type=int, default=0)
+    ap.add_argument("--save-union", default=None,
+                    help="parquet path to cache the scored union for ranker tuning")
     ap.add_argument("--sweep", action="store_true",
                     help="report the recall / candidate-size curve (train only)")
     args = ap.parse_args()
@@ -225,7 +254,10 @@ def main():
             truth_keys = np.sort(np.asarray(rows)[ok] * np.int64(len(others)) + j[ok])
             log(f"   {len(truth_keys):,} true pairs reachable in this country slice")
 
-        out.append(block_country(s1, others, truth_keys=truth_keys))
+        su = (args.save_union.replace('.parquet', f'_{c}.parquet')
+              if args.save_union else None)
+        out.append(block_country(s1, others, truth_keys=truth_keys,
+                                 save_union=su))
         del others
         gc.collect()
 

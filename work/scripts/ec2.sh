@@ -14,7 +14,7 @@
 set -euo pipefail
 
 HOST="${EC2_HOST:-mlbox}"
-KEY="${EC2_KEY:-$HOME/.ssh/id_ed25519}"
+KEY="${EC2_KEY:-$HOME/.ssh/ml_challenge_ec2}"
 REMOTE_DIR="${EC2_DIR:-~/mlchallenge}"
 LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 

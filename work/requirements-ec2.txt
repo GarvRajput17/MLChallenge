@@ -1,0 +1,8 @@
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.4
+scipy>=1.11
+lightgbm>=4.3
+rapidfuzz>=3.9
+sparse-dot-topn>=1.1
+pyarrow>=15

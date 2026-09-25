@@ -22,28 +22,37 @@ import numpy as np
 import scipy.sparse as sp
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler, Prefix
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
 from blocking import pair_cosine
-from common import log
+from common import THREADS as N_THREADS, log
 
-N_THREADS = max(1, os.cpu_count() or 4)
-
-# (feature name, record field, vectoriser kwargs) -- each is one "view" of the record
+# (feature name, record field, vectoriser kwargs) -- each is one "view" of the record.
+# char 3- and 4-grams share a single vectoriser: two fits over 5M documents to produce
+# near-duplicate signals was the single largest avoidable cost in this stage.
 COSINE_VIEWS = [
     ("name_tok",  "name_c",    dict(analyzer="word", ngram_range=(1, 1))),
-    ("name_c3",   "name_sq",   dict(analyzer="char", ngram_range=(3, 3))),
-    ("name_c4",   "name_sq",   dict(analyzer="char", ngram_range=(4, 4))),
+    ("name_ch",   "name_sq",   dict(analyzer="char", ngram_range=(3, 4))),
     ("ncore_tok", "name_core", dict(analyzer="word", ngram_range=(1, 1))),
     ("addr_tok",  "addr_c",    dict(analyzer="word", ngram_range=(1, 1))),
-    ("addr_c3",   "addr_c",    dict(analyzer="char", ngram_range=(3, 3))),
+    ("addr_ch",   "addr_c",    dict(analyzer="char", ngram_range=(3, 4))),
     ("acore_tok", "addr_core", dict(analyzer="word", ngram_range=(1, 1))),
     ("num_tok",   "nums",      dict(analyzer="word", ngram_range=(1, 1))),
 ]
 
-# views where we also want raw set overlap / containment, not just IDF-weighted cosine
+# Views where raw set overlap / containment is wanted alongside the IDF-weighted
+# cosine. The binary matrix is derived from the TF-IDF one by flattening its data
+# array -- same vocabulary, same tokenisation, so a second fit_transform over
+# millions of documents would compute exactly the same sparsity pattern twice.
 OVERLAP_VIEWS = ["name_tok", "ncore_tok", "addr_tok", "acore_tok", "num_tok"]
+
+if os.environ.get("ER_FAST", "0") == "1":
+    # Drop the two most expensive, most redundant views (char n-grams over the full
+    # address, and the name-core token view) when wall-clock is the constraint.
+    _DROP = {"addr_ch", "ncore_tok"}
+    COSINE_VIEWS = [v for v in COSINE_VIEWS if v[0] not in _DROP]
+    OVERLAP_VIEWS = [v for v in OVERLAP_VIEWS if v not in _DROP]
 
 RF_SCORERS = [
     ("ratio",  fuzz.ratio),                 # raw typo tolerance
@@ -53,16 +62,24 @@ RF_SCORERS = [
 ]
 
 
-def _vectorise(field_index, field_query, kwargs, binary=False):
-    cls = CountVectorizer if binary else TfidfVectorizer
-    extra = dict(binary=True, dtype=np.float32) if binary else dict(
-        sublinear_tf=True, dtype=np.float32, norm=None)
-    vec = cls(min_df=1, lowercase=False, **kwargs, **extra)
-    D = vec.fit_transform(field_index)
+def _vectorise(field_index, field_query, kwargs):
+    vec = TfidfVectorizer(min_df=1, lowercase=False, sublinear_tf=True,
+                          dtype=np.float32, norm=None, **kwargs)
+    try:
+        D = vec.fit_transform(field_index)
+    except ValueError:
+        return None, None            # whole view empty for this slice
+    if D.shape[1] == 0:
+        return None, None
     Q = vec.transform(field_query)
-    if not binary:
-        D, Q = normalize(D, copy=False), normalize(Q, copy=False)
-    return D, Q
+    return normalize(D, copy=False), normalize(Q, copy=False)
+
+
+def _binarise(X):
+    """Set-membership matrix sharing X's sparsity pattern -- no second fit needed."""
+    B = X.copy()
+    B.data[:] = 1.0
+    return B
 
 
 def _safe_div(a, b):
@@ -77,12 +94,14 @@ class FeatureBuilder:
         self.cos_D, self.cos_Q = {}, {}
         self.bin_D, self.bin_Q = {}, {}
         for name, field, kw in COSINE_VIEWS:
-            self.cos_D[name], self.cos_Q[name] = _vectorise(
-                s1[field].values, others[field].values, kw)
+            D, Q = _vectorise(s1[field].values, others[field].values, kw)
+            if D is None:
+                log(f"   view {name}: empty for this slice -- skipped")
+                continue
+            self.cos_D[name], self.cos_Q[name] = D, Q
             if name in OVERLAP_VIEWS:
-                self.bin_D[name], self.bin_Q[name] = _vectorise(
-                    s1[field].values, others[field].values, kw, binary=True)
-            log(f"   view {name}: |V|={self.cos_D[name].shape[1]:,}")
+                self.bin_D[name], self.bin_Q[name] = _binarise(D), _binarise(Q)
+            log(f"   view {name}: |V|={D.shape[1]:,}")
         self.bin_sizes_D = {k: np.asarray(v.sum(axis=1)).ravel().astype(np.float32)
                             for k, v in self.bin_D.items()}
         self.bin_sizes_Q = {k: np.asarray(v.sum(axis=1)).ravel().astype(np.float32)
@@ -91,10 +110,17 @@ class FeatureBuilder:
     # -------------------------------------------------------------- features --
     def build(self, s1_idx: np.ndarray, oth_idx: np.ndarray) -> dict:
         f = {}
+        n_pairs = len(s1_idx)
+        zeros = np.zeros(n_pairs, dtype=np.float32)
         for name, _, _ in COSINE_VIEWS:
-            f[f"cos_{name}"] = pair_cosine(self.cos_Q[name], self.cos_D[name],
-                                           oth_idx, s1_idx)
+            f[f"cos_{name}"] = (pair_cosine(self.cos_Q[name], self.cos_D[name],
+                                            oth_idx, s1_idx)
+                                if name in self.cos_D else zeros)
         for name in OVERLAP_VIEWS:
+            if name not in self.bin_D:
+                for k in ("jac", "cont", "n_%s_a" % name, "n_%s_b" % name):
+                    f[f"{k}_{name}" if k in ("jac", "cont") else k] = zeros
+                continue
             inter = pair_cosine(self.bin_Q[name], self.bin_D[name], oth_idx, s1_idx)
             a = self.bin_sizes_D[name][s1_idx]
             b = self.bin_sizes_Q[name][oth_idx]
@@ -110,14 +136,14 @@ class FeatureBuilder:
             tag = field.split("_")[0]
             for sname, scorer in RF_SCORERS:
                 f[f"{tag}_{sname}"] = process.cpdist(
-                    left, right, scorer=scorer, workers=-1,
+                    left, right, scorer=scorer, workers=N_THREADS,
                     dtype=np.float32, score_multiplier=0.01)
             f[f"{tag}_jw"] = process.cpdist(
                 left, right, scorer=JaroWinkler.normalized_similarity,
-                workers=-1, dtype=np.float32)
+                workers=N_THREADS, dtype=np.float32)
             f[f"{tag}_pref"] = process.cpdist(
                 left, right, scorer=Prefix.normalized_similarity,
-                workers=-1, dtype=np.float32)
+                workers=N_THREADS, dtype=np.float32)
             la = np.fromiter((len(x) for x in left), np.float32, len(left))
             lb = np.fromiter((len(x) for x in right), np.float32, len(right))
             f[f"{tag}_len_a"], f[f"{tag}_len_b"] = la, lb
@@ -128,11 +154,11 @@ class FeatureBuilder:
         # squashed-name similarity: immune to tokenisation and to the domain form
         left = list(self.s1["name_sq"].values[s1_idx])
         right = list(self.others["name_sq"].values[oth_idx])
-        f["sq_ratio"] = process.cpdist(left, right, scorer=fuzz.ratio, workers=-1,
+        f["sq_ratio"] = process.cpdist(left, right, scorer=fuzz.ratio, workers=N_THREADS,
                                        dtype=np.float32, score_multiplier=0.01)
         f["sq_jw"] = process.cpdist(left, right,
                                     scorer=JaroWinkler.normalized_similarity,
-                                    workers=-1, dtype=np.float32)
+                                    workers=N_THREADS, dtype=np.float32)
         f["sq_exact"] = np.fromiter((a == b for a, b in zip(left, right)),
                                     np.float32, len(left))
 

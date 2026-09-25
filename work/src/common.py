@@ -11,16 +11,29 @@ import numpy as np
 import pandas as pd
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # work/
-DATA = os.path.join(os.path.dirname(ROOT), "student_resource", "dataset")   # student_resource/dataset
-CACHE = os.path.join(ROOT, "cache")
-OUTPUT = os.path.join(ROOT, "output")
+# Overridable so the pipeline can be pointed at a synthetic fixture for smoke tests.
+DATA = os.environ.get(
+    "ER_DATA", os.path.join(os.path.dirname(ROOT), "student_resource", "dataset"))
+CACHE = os.environ.get("ER_CACHE", os.path.join(ROOT, "cache"))
+OUTPUT = os.environ.get("ER_OUTPUT", os.path.join(ROOT, "output"))
 REPORTS = os.path.join(ROOT, "reports")
+
+# Shared machines: never grab every core. Override with ER_THREADS.
+THREADS = int(os.environ.get("ER_THREADS", min(16, os.cpu_count() or 4)))
 for _d in (CACHE, OUTPUT, REPORTS):
     os.makedirs(_d, exist_ok=True)
 
 
+def mem_gb() -> float:
+    """Peak RSS of this process, in GB. Used to keep the memory budget visible in
+    the logs -- the blocking stage is the one that can exhaust a box."""
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 ** 2) if sys.platform == "linux" else peak / (1024 ** 3)
+
+
 def log(*a):
-    print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+    print(f"[{time.strftime('%H:%M:%S')} {mem_gb():5.1f}G]", *a, flush=True)
 
 
 # ---------------------------------------------------------------- loading ---

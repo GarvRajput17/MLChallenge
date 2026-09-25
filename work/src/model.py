@@ -21,7 +21,7 @@ import lightgbm as lgb
 import numpy as np
 from sklearn.isotonic import IsotonicRegression
 
-from common import log
+from common import THREADS, log
 
 PARAMS = dict(
     objective="binary",
@@ -34,7 +34,7 @@ PARAMS = dict(
     bagging_freq=1,
     lambda_l2=1.0,
     max_bin=255,
-    num_threads=max(1, os.cpu_count() or 4),
+    num_threads=THREADS,
     verbosity=-1,
 )
 
