@@ -204,6 +204,95 @@ def pair_cosine(Q: sp.csr_matrix, D: sp.csr_matrix, qi, di, chunk=2_000_000):
     return out
 
 
+def group_stats(keys: np.ndarray, score: np.ndarray):
+    """Per-row position of `score` within its `keys` group, all vectorised:
+    rank (0 = best), group size, gap to the group's best, and the best's margin over
+    the runner-up (broadcast to every row of the group)."""
+    order = np.lexsort((-score, keys))
+    k, s = keys[order], score[order]
+    new = np.ones(len(k), dtype=bool)
+    new[1:] = k[1:] != k[:-1]
+    starts = np.flatnonzero(new)
+    grp = np.cumsum(new) - 1
+    size = np.diff(np.append(starts, len(k)))
+    top = s[starts]
+    second = np.where(size > 1, s[np.minimum(starts + 1, len(s) - 1)], 0.0)
+    out = np.empty((len(k), 4), dtype=np.float32)
+    out[order, 0] = np.arange(len(k)) - starts[grp]
+    out[order, 1] = size[grp]
+    out[order, 2] = s - top[grp]
+    out[order, 3] = (top - second)[grp]
+    return out
+
+
+PRUNE_CHANNELS = ("name_sq", "addr", "name_tok", "addr_core", "joint", "dense", "link",
+                  "exact")
+
+
+def pruner_features(s1_idx, other_idx, name_cos, addr_cos, exact_hit, score, dense_cos,
+                    channel):
+    """Blocking-stage signals only -- no string comparisons -- so the learned prune
+    stays as cheap as the retrieval that feeds it. Rank/gap features are relative to
+    each S1's and each S2/S3 record's competing candidates, which is what lets them
+    transfer to countries the pruner never trained on."""
+    cols = [name_cos, addr_cos, exact_hit, score, dense_cos]
+    cols += [channel[c] for c in PRUNE_CHANNELS]
+    X = np.column_stack(cols + [group_stats(s1_idx, score), group_stats(other_idx, score)])
+    return X.astype(np.float32)
+
+
+PRUNER_FEATURES = (["name_cos", "addr_cos", "exact_hit", "block_score", "dense_cos"]
+                   + [f"ch_{c}" for c in PRUNE_CHANNELS]
+                   + [f"s1_{k}" for k in ("rank", "size", "gap", "margin")]
+                   + [f"cand_{k}" for k in ("rank", "size", "gap", "margin")])
+
+
+RICH_FIELDS = ("name_c", "addr_c", "addr_core", "nums")
+
+
+def rich_features(s1, others, s1_idx, oth_idx, threads=8, chunk=2_000_000):
+    """Second-stage prune features, computed only on first-stage survivors (~20 per
+    S1): per-field shared-token count / Jaccard / containment / weight of the rarest
+    shared token, plus three fuzzy scores. This is what generalized supervised
+    meta-blocking adds to the pruner; still linear in pairs, no model inference."""
+    from rapidfuzz import fuzz, process
+    from sklearn.feature_extraction.text import CountVectorizer
+    feats, names = [], []
+    n = len(s1_idx)
+    for field in RICH_FIELDS:
+        names += [f"{field}_{k}" for k in ("inter", "jac", "cont", "maxidf")]
+        try:
+            vec = CountVectorizer(binary=True, token_pattern=r"\S+", lowercase=False,
+                                  dtype=np.float32)
+            vec.fit(np.concatenate([s1[field].values, others[field].values]))
+        except ValueError:                           # empty field for this slice
+            feats += [np.zeros(n, np.float32)] * 4
+            continue
+        A, B = vec.transform(s1[field].values).tocsr(), vec.transform(others[field].values).tocsr()
+        dfreq = np.asarray(A.sum(0) + B.sum(0)).ravel()
+        idf = np.log((A.shape[0] + B.shape[0] + 1) / (dfreq + 1)).astype(np.float32)
+        Bw = (B @ sp.diags(idf)).tocsr()
+        inter = pair_cosine(B, A, oth_idx, s1_idx)   # binary rows: dot = shared tokens
+        a = np.asarray(A.sum(1)).ravel()[s1_idx]
+        b = np.asarray(B.sum(1)).ravel()[oth_idx]
+        maxidf = np.empty(n, np.float32)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            maxidf[s:e] = A[s1_idx[s:e]].multiply(Bw[oth_idx[s:e]]).max(axis=1).toarray().ravel()
+        union = a + b - inter
+        feats += [inter, np.divide(inter, union, out=np.zeros(n, np.float32), where=union > 0),
+                  np.divide(inter, np.minimum(a, b), out=np.zeros(n, np.float32),
+                            where=np.minimum(a, b) > 0), maxidf]
+    for name, field, scorer in (("fz_name_tset", "name_c", fuzz.token_set_ratio),
+                                ("fz_sq_ratio", "name_sq", fuzz.ratio),
+                                ("fz_addr_tset", "addr_c", fuzz.token_set_ratio)):
+        left, right = s1[field].values[s1_idx].tolist(), others[field].values[oth_idx].tolist()
+        feats.append(process.cpdist(left, right, scorer=scorer, workers=threads,
+                                    dtype=np.float32, score_multiplier=0.01))
+        names.append(name)
+    return np.column_stack(feats).astype(np.float32), names
+
+
 def combine(name_cos, addr_cos, exact_hit, mode="sum"):
     """Prune-ranking score. Chosen empirically -- see reports/tune.log.
 

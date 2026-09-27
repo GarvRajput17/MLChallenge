@@ -172,3 +172,10 @@ Pay attention to country-specific address patterns
 Consider the precision-recall trade-off carefully — F_0.5 rewards precision more than recall
 Do not neglect singletons — correctly predicting "no match" is worth a full 1.0 on that entity
 Validate your own output format against the rules above before submitting
+
+
+Additional Instruction:
+Update: candidate_pairs.tsv is part of your final submission
+
+Blocking has to scale. Amazon resolves business entities across billions of records, so comparing every record with every other one is not an option. Your blocking / candidate-generation step must cut the search space to a small candidate set per Source 1 entity.
+Candidate generation counts toward the final ranking. We will review your candidate_pairs.tsv and the code that produces it when deciding final rankings, alongside your matching_results.tsv score. The approach that generates a smaller candidate set per Source 1 entity will be ranked higher in the final evaluation beyond the public/private leaderboard.

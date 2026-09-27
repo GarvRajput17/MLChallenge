@@ -19,9 +19,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler, Prefix
+from rapidfuzz.distance import JaroWinkler, Levenshtein, Prefix
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
@@ -60,6 +61,48 @@ RF_SCORERS = [
     ("tset",   fuzz.token_set_ratio),       # tolerant of *added* junk tokens
     ("part",   fuzz.partial_ratio),         # DBA prefixes, long-vs-short
 ]
+
+
+def first_numbers(nums) -> tuple[np.ndarray, list[str]]:
+    """First digit run of each record's address -- its house number -- as a float (NaN when
+    absent) and as text. `nums` is the canonical space-joined digit runs, in address order."""
+    tok = pd.Series(list(nums), dtype="object").str.split(" ", n=1).str[0].fillna("").str[:9]
+    val = pd.to_numeric(tok.where(tok != ""), errors="coerce").to_numpy(np.float64)
+    return val, tok.tolist()
+
+
+def multiplicity(values) -> np.ndarray:
+    """For each record, how many records in the slice carry exactly this string. A name held by
+    one S1 record makes a name-only match trustworthy; one held by 30 makes it a guess -- which
+    is the difference between recoverable and unresolvable when the address is missing."""
+    s = pd.Series(list(values), dtype="object")
+    return s.map(s.value_counts()).to_numpy(np.float32)
+
+
+def number_features(va, ta, vb, tb, s1_idx, oth_idx) -> dict:
+    """How far apart are the two house numbers? Token overlap cannot say: '44' vs '49' and
+    '44' vs '9999' are both just 'different'. Yet the training labels separate them sharply:
+    an identical number or a large jump is a real match with a corrupted number, while a
+    small upward shift (+1..+25) on a pair that otherwise agrees is a decoy -- only ~6.5% of
+    such US pairs are true. Missing on either side -> NaN (the trees route it natively)."""
+    a, b = va[s1_idx], vb[oth_idx]
+    both = ~(np.isnan(a) | np.isnan(b))
+    d = b - a
+    nan = np.float32(np.nan)
+    out = {
+        "hn_delta": np.where(both, d, nan).astype(np.float32),
+        "hn_abs": np.where(both, np.abs(d), nan).astype(np.float32),
+        "hn_eq": np.where(both, (d == 0).astype(np.float32), nan),
+        "hn_small_pos": np.where(both, ((d >= 1) & (d <= 25)).astype(np.float32), nan),
+        "hn_ratio": np.where(both & (np.maximum(a, b) > 0),
+                             np.minimum(a, b) / np.maximum(np.maximum(a, b), 1), nan).astype(np.float32),
+        "hn_len_a": np.where(np.isnan(a), nan, np.floor(np.log10(np.maximum(a, 1))) + 1).astype(np.float32),
+    }
+    left = [ta[i] for i in s1_idx]
+    right = [tb[j] for j in oth_idx]
+    lev = process.cpdist(left, right, scorer=Levenshtein.distance, workers=N_THREADS, dtype=np.float32)
+    out["hn_lev"] = np.where(both, lev, nan).astype(np.float32)
+    return out
 
 
 def _vectorise(field_index, field_query, kwargs):
@@ -102,6 +145,10 @@ class FeatureBuilder:
             if name in OVERLAP_VIEWS:
                 self.bin_D[name], self.bin_Q[name] = _binarise(D), _binarise(Q)
             log(f"   view {name}: |V|={D.shape[1]:,}")
+        self.mult_a, self.mult_core_a = multiplicity(s1["name_c"].values), multiplicity(s1["name_core"].values)
+        self.mult_b = multiplicity(others["name_c"].values)
+        self.hn_a, self.hn_ta = first_numbers(s1["nums"].values)
+        self.hn_b, self.hn_tb = first_numbers(others["nums"].values)
         self.bin_sizes_D = {k: np.asarray(v.sum(axis=1)).ravel().astype(np.float32)
                             for k, v in self.bin_D.items()}
         self.bin_sizes_Q = {k: np.asarray(v.sum(axis=1)).ravel().astype(np.float32)
@@ -170,6 +217,11 @@ class FeatureBuilder:
              for x, y in zip(pa, pb)), np.float32, len(pa))
         f["postal_known"] = np.fromiter(
             (1.0 if (x and y) else 0.0 for x, y in zip(pa, pb)), np.float32, len(pa))
+
+        f.update(number_features(self.hn_a, self.hn_ta, self.hn_b, self.hn_tb, s1_idx, oth_idx))
+        f["s1_name_mult"] = self.mult_a[s1_idx]
+        f["s1_core_mult"] = self.mult_core_a[s1_idx]
+        f["oth_name_mult"] = self.mult_b[oth_idx]
 
         # provenance: S2 and S3 have measurably different noise profiles
         f["src_is_s3"] = np.fromiter(

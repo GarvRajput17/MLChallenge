@@ -18,7 +18,7 @@ step() { echo; echo "######## $* ########"; date "+%H:%M:%S"; }
 echo "threads: $ER_THREADS   train subsample: $TRAIN_S1/country   rounds: $ROUNDS"
 
 step "1/6 blocking: train (subsample ${TRAIN_S1}/country)"
-python3 -u src/run_blocking.py --split train --limit-s1 "$TRAIN_S1" --sweep
+python3 -u src/run_blocking.py --split train --limit-s1 "$TRAIN_S1"
 
 step "2/6 features: train"
 python3 -u src/build_features.py --split train

@@ -9,16 +9,17 @@
 set -euo pipefail
 export PATH=/usr/local/bin:$PATH
 
-TYPE="${EC2_TYPE:-r7i.2xlarge}"      # 8 vCPU / 64 GB -- the most our 8-vCPU quota allows
+TYPE="${EC2_TYPE:-r7i.8xlarge}"      # 32 vCPU / 256 GB; pipeline threads + parallel prep
 DISK_GB="${EC2_DISK:-300}"
 NAME="${EC2_NAME:-ml-challenge}"
 KEY_NAME="$NAME"
 SG_NAME="$NAME-sg"
-PUBKEY="${EC2_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+PUBKEY="${EC2_PUBKEY:-$HOME/.ssh/ml-challenge.pub}"
+PROFILE="${EC2_PROFILE:-ml-challenge-ec2}"   # IAM role: read the dataset from S3
 
 ami() {
   aws ssm get-parameter --name \
-    /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+    /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
     --query Parameter.Value --output text
 }
 instance_id() {
@@ -30,16 +31,15 @@ instance_id() {
 case "${1:-plan}" in
 plan)
     echo "region     : $(aws configure get region)"
-    echo "instance   : $TYPE   (8 vCPU / 64 GB -- the 8-vCPU Standard quota ceiling)"
-    echo "AMI        : $(ami)  (Ubuntu 22.04 LTS)"
+    echo "instance   : $TYPE"
+    echo "AMI        : $(ami)  (Ubuntu 24.04 LTS -- python 3.12, needed by pandas 3)"
     echo "disk       : ${DISK_GB} GB gp3"
     echo "key pair   : $KEY_NAME  <- imported from $PUBKEY"
     echo "security   : $SG_NAME, inbound TCP 22 from $(curl -s https://checkip.amazonaws.com)/32 only"
     echo
     echo "approximate cost (us-east-1, VERIFY in console -- rates move):"
-    echo "  compute  ~\$0.53/hr while RUNNING, \$0 while stopped"
+    echo "  compute  ~\$2.12/hr (r7i.8xlarge) while RUNNING, \$0 while stopped"
     echo "  disk     ~\$24/month for ${DISK_GB} GB gp3, charged even when stopped"
-    echo "  30 hours of actual work  =>  roughly \$16 compute + ~\$1 disk"
     echo
     echo "nothing has been created. run './aws_launch.sh up' to proceed."
     ;;
@@ -65,6 +65,7 @@ up)
 
     ID=$(aws ec2 run-instances --image-id "$(ami)" --instance-type "$TYPE" \
         --key-name "$KEY_NAME" --security-group-ids "$SG_ID" --count 1 \
+        --iam-instance-profile "Name=$PROFILE" \
         --instance-initiated-shutdown-behavior stop \
         --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \

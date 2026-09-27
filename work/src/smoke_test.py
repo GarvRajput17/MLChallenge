@@ -25,7 +25,7 @@ def typo(s, rng):
     return s[:i] + s[i + 1] + s[i] + s[i + 2:]
 
 
-def gen(path, n_entities=1500, seed=0):
+def gen(path, n_entities=1500, seed=0, countries=("India", "US")):
     rng = random.Random(seed)
     os.makedirs(path, exist_ok=True)
     s1, s2, s3, gt = [], [], [], []
@@ -37,7 +37,8 @@ def gen(path, n_entities=1500, seed=0):
         city, state, abbr = rng.choice(CITIES[:2] if india else CITIES[2:])
         num = rng.randrange(10, 9999)
         addr = f"{num} {rng.choice(STREETS)}, {city}, {state}"
-        country = "India" if india else "US"
+        # test adds labels never seen in training: the pipeline must treat country as open
+        country = ("India" if india else "US") if rng.random() < 0.6 else rng.choice(countries)
         sid = f"S1-{e:06d}"
         s1.append((sid, name.title(), addr.title(), country))
 
@@ -66,7 +67,7 @@ def gen(path, n_entities=1500, seed=0):
         gt.append((sid, ",".join(matches)))
 
     for i in range(n_entities // 3):                 # distractors matching nothing
-        country = "India" if i % 2 else "US"
+        country = rng.choice(countries)
         city, state, _ = rng.choice(CITIES)
         row = (f"S2-D{i:06d}", f"Zeta {i} Holdings", f"{i} Far Lane, {city}, {state}", country)
         s2.append(row)
@@ -78,6 +79,8 @@ def gen(path, n_entities=1500, seed=0):
             for r in rows:
                 fh.write("\t".join(r) + "\n")
 
+    s1.append(("S1-LONE", "Solo Traders", "1 Nowhere Road", "Atlantis"))   # no S2/S3 at all
+    gt.append(("S1-LONE", ""))
     hdr = ["entity_id", "business_name", "business_address", "country"]
     dump("train_source1.tsv", s1, hdr); dump("train_source2.tsv", s2, hdr)
     dump("train_source3.tsv", s3, hdr)
@@ -89,7 +92,8 @@ def main():
     tmp = tempfile.mkdtemp(prefix="er_smoke_")
     data = os.path.join(tmp, "dataset")
     for split in ("train", "test"):
-        n = gen(os.path.join(data, split), seed=0 if split == "train" else 1)
+        n = gen(os.path.join(data, split), seed=0 if split == "train" else 1,
+                countries=("India", "US") if split == "train" else ("France", "Japan"))
         if split == "test":   # test dir needs test_* names and no ground truth
             d = os.path.join(data, "test")
             for f in os.listdir(d):
@@ -99,15 +103,18 @@ def main():
                     os.rename(os.path.join(d, f),
                               os.path.join(d, f.replace("train_", "test_", 1)))
         print(f"  {split}: {n}")
+        n_test_s1 = n[0]
     env = dict(os.environ, ER_DATA=data, ER_CACHE=os.path.join(tmp, "cache"),
-               ER_OUTPUT=os.path.join(tmp, "output"))
+               ER_OUTPUT=os.path.join(tmp, "output"), ER_SELF_MIN_PAIRS="50")
     steps = [
-        ["prep_basic.py"], ["learn_lexicons.py"], ["normalize.py"],
-        ["run_blocking.py", "--split", "train", "--sweep"],
+        ["prep_basic.py"], ["adaptive_config.py"], ["learn_lexicons.py"], ["normalize.py"],
+        ["run_blocking.py", "--split", "train"],
         ["run_blocking.py", "--split", "test"],
         ["build_features.py", "--split", "train"],
         ["build_features.py", "--split", "test"],
         ["train.py", "--rounds", "80"],
+        ["predict.py", "--split", "test"],
+        ["self_train.py", "--split", "test"],
         ["predict.py", "--split", "test"],
     ]
     for step in steps:
@@ -124,7 +131,9 @@ def main():
     out = env["ER_OUTPUT"]
     for f in ("matching_results.tsv", "candidate_pairs.tsv"):
         p = os.path.join(out, f)
-        print(f"\n{f}: {sum(1 for _ in open(p))} lines")
+        n_rows = sum(1 for _ in open(p)) - 1
+        print(f"\n{f}: {n_rows} rows")
+        assert n_rows == n_test_s1, f"{f}: {n_rows} rows for {n_test_s1} S1 entities"
         print("".join(open(p).readlines()[:4]))
     print("SMOKE TEST PASSED")
 

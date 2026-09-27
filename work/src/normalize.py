@@ -12,6 +12,11 @@ For every record we cache:
 
 Countries absent from the lexicons (France) simply fall through with basic
 normalisation only -- nothing hard-codes the training country set.
+
+Adaptive stop words (adaptive_config.py, fitted on the records at hand before this stage):
+the fitted stop words are also dropped from the *_core views. ER_ADAPTIVE=0 turns it off.
+Measured on the US-as-unseen bench: +0.0010 F0.5, India unaffected. Collapsing the fitted
+end-of-string groups into placeholders was also tried and cost -0.0142, so it was removed.
 """
 from __future__ import annotations
 
@@ -32,22 +37,30 @@ NULLS = frozenset(("null", "nan", "none", "na", "nil", "n", "a", "unknown", "nu1
 GENERIC_NAME_TOP = 120
 GENERIC_ADDR_TOP = 120
 _DIGITS = re.compile(r"\d+")
+ADAPTIVE = os.environ.get("ER_ADAPTIVE", "core")     # core | 0 (off)
 
 
 class FieldMaps:
     """Canonicalisation tables for one (country, field)."""
-    __slots__ = ("sub", "expand", "generic")
+    __slots__ = ("sub", "expand", "generic", "prefix")
 
-    def __init__(self, lex: dict | None, generic_top: int):
+    def __init__(self, lex: dict | None, generic_top: int, adaptive: dict | None = None):
         lex = lex or {}
         self.sub = {**lex.get("variant", {}), **lex.get("translit", {})}
         self.expand = {k: v.split() for k, v in lex.get("expand", {}).items()}
         self.generic = frozenset(list(lex.get("generic", {}))[:generic_top])
+        self.prefix = frozenset(lex.get("prefix", ()))
+        if adaptive and ADAPTIVE != "0":
+            self.generic |= frozenset(adaptive["stop"])
 
     def apply(self, text: str) -> list[str]:
         out = []
         sub, expand = self.sub, self.expand
-        for tok in text.split():
+        toks = text.split()
+        i = 0
+        while i < len(toks) - 1 and toks[i] in self.prefix:   # Shri/Dr/The -- never empties
+            i += 1
+        for tok in toks[i:]:
             if tok in NULLS:
                 continue
             tok = sub.get(tok, tok)
@@ -62,10 +75,18 @@ class FieldMaps:
 def load_maps() -> dict:
     with open(os.path.join(CACHE, "lexicons.json"), encoding="utf-8") as fh:
         lex = json.load(fh)
+    adaptive = {}
+    path = os.path.join(CACHE, "norm_config.json")
+    if ADAPTIVE != "0":
+        if not os.path.exists(path):
+            raise SystemExit(f"{path} is missing; run adaptive_config.py first (or set ER_ADAPTIVE=0)")
+        with open(path, encoding="utf-8") as fh:
+            adaptive = json.load(fh)
     maps = {}
-    for country, fields in lex.items():
-        maps[country] = (FieldMaps(fields.get("name_b"), GENERIC_NAME_TOP),
-                         FieldMaps(fields.get("addr_b"), GENERIC_ADDR_TOP))
+    for country in set(lex) | set(adaptive):
+        fields, ad = lex.get(country, {}), adaptive.get(country, {})
+        maps[country] = (FieldMaps(fields.get("name_b"), GENERIC_NAME_TOP, ad.get("name_b")),
+                         FieldMaps(fields.get("addr_b"), GENERIC_ADDR_TOP, ad.get("addr_b")))
     maps[None] = (FieldMaps(None, 0), FieldMaps(None, 0))     # unseen countries
     return maps
 

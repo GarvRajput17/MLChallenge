@@ -3,7 +3,7 @@ from __future__ import annotations
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
-from common import CACHE, load_source, basic_norm, log
+from common import CACHE, load_source, basic_norm, name_norm, log
 
 
 def build(split: str, src: int) -> pd.DataFrame:
@@ -15,7 +15,7 @@ def build(split: str, src: int) -> pd.DataFrame:
     out = pd.DataFrame({
         "entity_id": df["entity_id"].values,
         "country": df["country"].values,
-        "name_b": [basic_norm(x) for x in df["business_name"].values],
+        "name_b": [name_norm(x) for x in df["business_name"].values],
         "addr_b": [basic_norm(x) for x in df["business_address"].values],
     })
     out.to_parquet(pq, index=False)

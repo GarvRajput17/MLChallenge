@@ -69,7 +69,7 @@ def build(split: str, countries=None):
             log(f"   pairs {start:,}-{end:,}")
             feats = fb.build(s1_pos[start:end], oth_pos[start:end])
             block = pd.DataFrame(feats)
-            for col in ("name_cos", "addr_cos", "exact_hit", "block_score"):
+            for col in ("name_cos", "addr_cos", "exact_hit", "block_score", "dense_cos", "prune_p"):
                 block[f"blk_{col}"] = sub[col].values[start:end]
             block.insert(0, "s1_entity_id", sub["s1_entity_id"].values[start:end])
             block.insert(1, "cand_entity_id", sub["cand_entity_id"].values[start:end])

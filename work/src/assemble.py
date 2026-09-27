@@ -5,6 +5,8 @@ never drift apart.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -60,6 +62,33 @@ def rival_margin(cand_ids: np.ndarray, probs: np.ndarray) -> np.ndarray:
     is_first[1:] = sid[1:] != sid[:-1]
     out[order] = np.where(is_first, sp - second, 0.0).astype(np.float32)
     return out
+
+
+CTX_COLS = ["ctx_margin", "ctx_best", "ctx_rank", "ctx_n_cand", "raw_score", "ctx_s1_eq", "ctx_cand_eq"]
+
+
+def add_context(df: pd.DataFrame, raw: np.ndarray) -> pd.DataFrame:
+    """Second-stage features the pairwise model cannot see: how this candidate's
+    stage-1 score compares with the rivals competing for it and with the S1 entity's
+    other candidates. Shared by training, validation and inference."""
+    df["ctx_margin"] = rival_margin(df["cand_entity_id"].values, raw)
+    grp = df.groupby("s1_entity_id")
+    df["ctx_best"] = grp["ctx_margin"].transform("max")
+    df["ctx_rank"] = grp["ctx_margin"].rank(ascending=False, method="first")
+    df["ctx_n_cand"] = grp["ctx_margin"].transform("size")
+    df["raw_score"] = raw
+    # Decoys are near-copies of a real business with the house number nudged up. If this S1
+    # already has confident copies with the IDENTICAL number, a same-name copy with a different
+    # number is a decoy; and if this record already fits another S1 with an identical number,
+    # it belongs there. Zeros when the shard predates the number features.
+    if "hn_eq" in df and os.environ.get("ER_CTX_EQ", "1") != "0":
+        eq = ((df["hn_eq"].to_numpy() == 1) & (raw >= 0.5)).astype(np.float32)
+    else:
+        eq = np.zeros(len(df), np.float32)
+    eqs = pd.Series(eq, index=df.index)
+    df["ctx_s1_eq"] = eqs.groupby(df["s1_entity_id"]).transform("sum") - eq
+    df["ctx_cand_eq"] = eqs.groupby(df["cand_entity_id"]).transform("sum") - eq
+    return df
 
 
 def choose(df: pd.DataFrame, probs: np.ndarray, *, miss_prior=0.0,

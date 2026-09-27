@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from assemble import choose, rival_margin, to_submission
+from assemble import add_context, choose, to_submission
 from common import CACHE, OUTPUT, log
+from model import stage2_predict
 from train import load_features
 
 
@@ -32,15 +33,10 @@ def main():
     raw = art["booster"].predict(X, num_iteration=art["booster"].best_iteration)
     del X
 
-    df["ctx_margin"] = rival_margin(df["cand_entity_id"].values, raw)
-    grp = df.groupby("s1_entity_id")
-    df["ctx_best"] = grp["ctx_margin"].transform("max")
-    df["ctx_rank"] = grp["ctx_margin"].rank(ascending=False, method="first")
-    df["ctx_n_cand"] = grp["ctx_margin"].transform("size")
-    df["raw_score"] = raw
+    add_context(df, raw)
 
     X2 = df[art["feat_cols2"]].to_numpy(dtype=np.float32)
-    raw2 = art["booster2"].predict(X2, num_iteration=art["booster2"].best_iteration)
+    raw2 = stage2_predict(art, X2)
     del X2
     probs = art["iso"].predict(raw2)
     log(f"scored {len(probs):,} candidate pairs; mean p = {probs.mean():.4f}")

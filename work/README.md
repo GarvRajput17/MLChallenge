@@ -42,10 +42,14 @@ Complementary *views* (squashed-name char n-grams, address tokens, name tokens, 
 core) replace a reverse pass: each ranks differently, so the union recovers pairs any
 single view would crowd out.
 
-**The candidate set is deliberately small.** After the union, both principal cosines are
-recomputed *exactly* on every surviving pair, then each entity keeps only its best
-`max_per_entity`. `--sweep` reports the pair-completeness / candidates-per-entity curve
-so the cut is tuned against both objectives rather than guessed.
+**The candidate set is deliberately small.** A joint name+address channel retrieves on
+both fields at once, so the address breaks ties between the many S1 entities that share
+a name. After the union, both principal cosines are recomputed *exactly*, and a small
+learned pruner (LightGBM on blocking-stage signals only: channel scores, and each pair's
+rank/gap among its S1's and its S2/S3 record's competing candidates) keeps a candidate
+only if `p >= ER_PRUNE_T` (default 0.01), at most `ER_M` per entity. The cut adapts per
+entity instead of a fixed top-k. The pruner trains on non-validation entities only and
+logs its held-out candidates-per-entity / pair-completeness curve.
 
 **Decisions maximise expected F₀.₅ directly.** `F_β = (1+β²)·TP / (β²K + |S|)`, so given
 calibrated probabilities the expected score of a candidate set is exactly computable.

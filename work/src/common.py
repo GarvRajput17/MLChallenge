@@ -59,39 +59,45 @@ def load_ground_truth() -> pd.DataFrame:
 
 
 # ---------------------------------------------------- unicode / normalise ---
-_INDIC_RANGES = [
-    (0x0900, 0x097F),  # Devanagari
-    (0x0980, 0x09FF),  # Bengali
-    (0x0A00, 0x0A7F),  # Gurmukhi
-    (0x0A80, 0x0AFF),  # Gujarati
-    (0x0B00, 0x0B7F),  # Oriya
-    (0x0B80, 0x0BFF),  # Tamil
-    (0x0C00, 0x0C7F),  # Telugu
-    (0x0C80, 0x0CFF),  # Kannada
-    (0x0D00, 0x0D7F),  # Malayalam
-]
+def _is_folded_base(o: int) -> bool:
+    """Scripts whose diacritics are folded away (Latin, Greek, Cyrillic): é -> e.
+    Marks on any other script (Indic, Arabic, Thai, ...) are part of the letter."""
+    return o < 0x0530 or 0x1E00 <= o <= 0x1FFF
 
 
-def is_indic_char(ch: str) -> bool:
-    o = ord(ch)
-    return any(a <= o <= b for a, b in _INDIC_RANGES)
+def has_non_latin(s: str) -> bool:
+    """Any letter outside Latin -- a transliteration candidate. Script-agnostic."""
+    return any(c.isalpha() and ord(c) > 0x024F and not 0x1E00 <= ord(c) <= 0x1EFF
+               for c in s)
 
 
-def has_indic(s: str) -> bool:
-    return any(is_indic_char(c) for c in s)
-
-
-_PUNCT_RE = re.compile(r"[^\w\sऀ-෿]+", re.UNICODE)
+# \w excludes combining marks, so without this Indic/Arabic/Thai words split apart.
+_MARKS, _run = "", None
+for _c in range(sys.maxunicode + 2):
+    _is_m = _c <= sys.maxunicode and unicodedata.category(chr(_c)).startswith("M")
+    if _is_m and _run is None:
+        _run = _c
+    elif not _is_m and _run is not None:
+        _MARKS += f"{re.escape(chr(_run))}-{re.escape(chr(_c - 1))}"
+        _run = None
+_PUNCT_RE = re.compile(rf"[^\w\s{_MARKS}]+", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
 _NULLS = {"null", "nan", "none", "n a", "na", "nil", ""}
+# Latin letters NFKC does not decompose.
+_LIGATURES = str.maketrans({"œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE", "ß": "ss",
+                            "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
+                            "þ": "th", "Þ": "TH"})
 
 
 def strip_accents(s: str) -> str:
-    """Fold Latin diacritics (Énterprises -> enterprises) but leave Indic intact."""
-    out = []
-    for ch in unicodedata.normalize("NFD", s):
-        if unicodedata.combining(ch) and not is_indic_char(ch):
-            continue
+    """Fold diacritics on Latin/Greek/Cyrillic letters; keep marks on other scripts."""
+    out, base = [], 0
+    for ch in unicodedata.normalize("NFD", s.translate(_LIGATURES)):
+        if unicodedata.combining(ch):
+            if _is_folded_base(base):
+                continue
+        else:
+            base = ord(ch)
         out.append(ch)
     return unicodedata.normalize("NFC", "".join(out))
 
@@ -107,6 +113,26 @@ def basic_norm(s: str) -> str:
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
     return s
+
+
+# Names only -- each measured on train ground-truth pairs; on addresses they hurt India.
+_ACRONYM_RE = re.compile(r"\b(?:[A-Za-z][./] ?)+[A-Za-z]\b\.?")      # S.A.S. L.L.C. a/k/a
+_APOS_RE = re.compile(r"(?<=\w)[’'`´](?=\w)")                         # L'Atelier -> latelier
+# Digit-for-letter typos (a1lied, harb0r): S1 names never mix letters and digits in a
+# token, and aligned train pairs give exactly these substitutions (1->i seen twice).
+_LEET_RE = re.compile(r"\b(?=[a-z0-9]*[a-z])(?=[a-z0-9]*\d)[a-z0-9]+\b")
+_LEET = str.maketrans("01568", "olsgb")
+_ALIAS_RE = re.compile(r"^.*\b(?:dba|fka|aka|formerly|doing business as|trading as|ta)\b\s*")  # S1 name follows
+
+
+def name_norm(s: str) -> str:
+    """basic_norm plus: join dotted acronyms, delete (not space) apostrophes, and drop
+    everything up to an alias marker ('Korbrixx D.B.A. Obsidian' -> 'obsidian')."""
+    s = _ACRONYM_RE.sub(lambda m: re.sub(r"[./ ]", "", m.group()), s)
+    s = _APOS_RE.sub("", s)
+    s = basic_norm(s)
+    s = _LEET_RE.sub(lambda m: m.group().translate(_LEET), s)
+    return _ALIAS_RE.sub("", s) or s
 
 
 def drop_null_tokens(tokens):

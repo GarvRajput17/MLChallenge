@@ -65,6 +65,40 @@ def train(X: np.ndarray, y: np.ndarray, folds: np.ndarray, feature_names,
     return booster, va
 
 
+XGB_PARAMS = dict(objective="binary:logistic", eval_metric="logloss", tree_method="hist",
+                  eta=0.08, max_depth=8, subsample=0.85, colsample_bytree=0.85,
+                  min_child_weight=20, reg_lambda=1.0)
+
+
+def train_xgb(X, y, val_mask, num_boost_round=2000, early_stopping=60):
+    """XGBoost twin of the stage-2 LightGBM, blended with it in stage2_predict."""
+    import xgboost as xgb
+    dtr = xgb.DMatrix(X[~val_mask], label=y[~val_mask], nthread=THREADS)
+    dva = xgb.DMatrix(X[val_mask], label=y[val_mask], nthread=THREADS)
+    b = xgb.train(dict(XGB_PARAMS, nthread=THREADS), dtr, num_boost_round,
+                  evals=[(dva, "val")], early_stopping_rounds=early_stopping, verbose_eval=200)
+    log(f"xgboost best iteration {b.best_iteration}")
+    return b
+
+
+def _logit(p):
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    return np.log(p / (1 - p))
+
+
+def stage2_predict(art, X2, use_blend=None):
+    """Stage-2 probability: LightGBM, or its logit-average with XGBoost when training
+    found the blend better on held-out entities (art['blend'])."""
+    p = art["booster2"].predict(X2, num_iteration=art["booster2"].best_iteration)
+    blend = art.get("blend", False) if use_blend is None else use_blend
+    if blend and art.get("xgb2") is not None:
+        import xgboost as xgb
+        px = art["xgb2"].predict(xgb.DMatrix(X2, nthread=THREADS),
+                                 iteration_range=(0, art["xgb2"].best_iteration + 1))
+        p = 1 / (1 + np.exp(-(_logit(p) + _logit(px)) / 2))
+    return p
+
+
 def fit_calibrator(raw_scores: np.ndarray, y: np.ndarray) -> IsotonicRegression:
     iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
     iso.fit(raw_scores, y)
