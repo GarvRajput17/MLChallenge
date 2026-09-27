@@ -8,12 +8,19 @@ over fold-0 entities before being refit on all of them and applied to test.
     python3 src/stack.py --ce-dir /tmp/ce                       # train + report
     python3 src/stack.py --ce-dir /tmp/ce --predict --outdir output_ce
         [--ce-countries US India]    # cross-encoder only there; matcher elsewhere
+
+Kit mode (GPU-side iteration without the CPU box): `--export-kit DIR` on the CPU box writes
+the matcher's outputs for fold 0 and for test, plus what the decision layer needs, into DIR.
+Anywhere else, `--kit DIR` replaces the feature shards and matcher.pkl with that kit -- the
+same blend, CV check and submission files, but only a cross-encoder's scores are new input.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pickle
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,11 +77,40 @@ def apply(model, df):
     return iso.predict(b.predict(df[STACK_COLS]))
 
 
+KIT_COLS = ["s1_entity_id", "cand_entity_id", "country", "p_lgb"] + [c for c in STACK_COLS if c != "l_ce"]
+
+
+def base_frame(split, M, kit=None):
+    """Matcher outputs for a split's pairs; for train, only validation fold 0 (context features
+    are computed over the whole shard first -- they need every rival)."""
+    if kit:
+        return pd.read_parquet(os.path.join(kit, f"{split}_base.parquet"))
+    df = matcher_probs(load_features(split), M)
+    if split == "train":
+        df = df[entity_fold(df["s1_entity_id"].values) == 0].reset_index(drop=True)
+    return df
+
+
+def export_kit(kit, M):
+    os.makedirs(kit, exist_ok=True)
+    for split in ("train", "test"):
+        cols = KIT_COLS + (["label"] if split == "train" else [])
+        df = base_frame(split, M)
+        df[cols].to_parquet(os.path.join(kit, f"{split}_base.parquet"), index=False)
+        log(f"kit: {split}_base.parquet {len(df):,} pairs")
+    pq.read_table(os.path.join(CACHE, "test_s1_canon.parquet"), columns=["entity_id"]) \
+        .to_pandas().to_parquet(os.path.join(kit, "test_s1_ids.parquet"), index=False)
+    shutil.copy(os.path.join(CACHE, "train_ground_truth.parquet"), kit)
+    with open(os.path.join(kit, "meta.json"), "w") as fh:
+        json.dump({k: M[k] for k in ("miss_prior", "size_penalty", "val_score")}, fh)
+    log(f"kit written to {kit}")
+
+
 def train(args, M):
-    df = matcher_probs(load_features("train"), M)
-    df = df[entity_fold(df["s1_entity_id"].values) == 0].reset_index(drop=True)
+    df = base_frame("train", M, args.kit)
     df = with_ce(df, os.path.join(args.ce_dir, "eval_ce.parquet"))
-    gt = load_ground_truth()
+    gt = pd.read_parquet(os.path.join(args.kit, "train_ground_truth.parquet")) if args.kit \
+        else load_ground_truth()
     truth = {s: {i for i in ids if i} for s, ids in
              zip(gt["source1_entity_id"], gt["matched_entity_ids"].str.split(","))}
     ents = df["s1_entity_id"].unique()
@@ -96,16 +132,16 @@ def train(args, M):
         f"matcher+cross-encoder {np.mean(stacked):.5f}  "
         f"gain {np.mean(stacked) - np.mean(base):+.5f}")
     model = fit(df)
-    with open(os.path.join(CACHE, "stacker.pkl"), "wb") as fh:
+    path = os.path.join(args.kit or CACHE, "stacker.pkl")
+    with open(path, "wb") as fh:
         pickle.dump(dict(model=model, cv_gain=float(np.mean(stacked) - np.mean(base))), fh)
-    log("wrote cache/stacker.pkl")
+    log(f"wrote {path}")
 
 
 def predict(args, M):
-    with open(os.path.join(CACHE, "stacker.pkl"), "rb") as fh:
+    with open(os.path.join(args.kit or CACHE, "stacker.pkl"), "rb") as fh:
         S = pickle.load(fh)
-    df = with_ce(matcher_probs(load_features("test"), M),
-                 os.path.join(args.ce_dir, "score_ce.parquet"))
+    df = with_ce(base_frame("test", M, args.kit), os.path.join(args.ce_dir, "score_ce.parquet"))
     p = apply(S["model"], df)
     if args.ce_countries:
         use = df["country"].isin(args.ce_countries).to_numpy()
@@ -113,8 +149,9 @@ def predict(args, M):
         log(f"cross-encoder applied to {use.mean():.1%} of pairs ({', '.join(args.ce_countries)})")
     pairs = df[["s1_entity_id", "cand_entity_id"]]
     accepted = choose(pairs, p, miss_prior=M["miss_prior"], size_penalty=M["size_penalty"])
-    s1_ids = pq.read_table(os.path.join(CACHE, "test_s1_canon.parquet"),
-                           columns=["entity_id"]).to_pandas()["entity_id"].values
+    s1_ids = (pd.read_parquet(os.path.join(args.kit, "test_s1_ids.parquet")) if args.kit else
+              pq.read_table(os.path.join(CACHE, "test_s1_canon.parquet"), columns=["entity_id"]).to_pandas()
+              )["entity_id"].values
     os.makedirs(args.outdir, exist_ok=True)
     matching = to_submission(accepted, s1_ids)
     matching.to_csv(os.path.join(args.outdir, "matching_results.tsv"), sep="\t", index=False)
@@ -128,13 +165,23 @@ def predict(args, M):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ce-dir", required=True, help="dir with eval_ce.parquet / score_ce.parquet")
+    ap.add_argument("--ce-dir", help="dir with eval_ce.parquet / score_ce.parquet")
     ap.add_argument("--predict", action="store_true")
     ap.add_argument("--outdir", default=OUTPUT)
     ap.add_argument("--ce-countries", nargs="*", default=None)
+    ap.add_argument("--kit", default=None, help="use an exported kit instead of features + matcher.pkl")
+    ap.add_argument("--export-kit", default=None, help="write a kit to this dir and exit")
     args = ap.parse_args()
-    with open(os.path.join(CACHE, "matcher.pkl"), "rb") as fh:
-        M = pickle.load(fh)
+    if args.kit:
+        with open(os.path.join(args.kit, "meta.json")) as fh:
+            M = json.load(fh)
+    else:
+        with open(os.path.join(CACHE, "matcher.pkl"), "rb") as fh:
+            M = pickle.load(fh)
+    if args.export_kit:
+        return export_kit(args.export_kit, M)
+    if not args.ce_dir:
+        ap.error("--ce-dir is required")
     predict(args, M) if args.predict else train(args, M)
 
 
