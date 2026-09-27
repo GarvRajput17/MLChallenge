@@ -1,0 +1,8 @@
+# GPU stages (dense_encoder.py, cross_encoder.py). Versions as used on the GPU server;
+# the SageMaker jobs ran the AWS PyTorch 2.8 DLC with transformers 4.5x.
+torch==2.8.0
+transformers==4.57.6
+pandas==3.0.1
+pyarrow==19.0.1
+scikit-learn==1.6.1
+boto3

@@ -56,12 +56,36 @@ def matcher_probs(df, M):
     return df
 
 
-def with_ce(df, path):
+def with_ce(df, path, col="l_ce"):
     ce = pd.read_parquet(path, columns=["s1_entity_id", "cand_entity_id", "ce_p"])
     df = df.merge(ce, on=["s1_entity_id", "cand_entity_id"], how="left")
     miss = df["ce_p"].isna().mean()
     assert miss < 0.001, f"{miss:.2%} of pairs have no cross-encoder score"
-    df["l_ce"] = logit(df["ce_p"].fillna(0.5).to_numpy())
+    df[col] = logit(df["ce_p"].fillna(0.5).to_numpy())
+    return df.drop(columns="ce_p")
+
+
+def with_ces(df, dirs, name):
+    """One logit column per cross-encoder (l_ce, l_ce2, ...); the stacker learns their weights."""
+    global STACK_COLS
+    cols = ["l_ce"] + [f"l_ce{i + 2}" for i in range(len(dirs) - 1)]
+    for d, c in zip(dirs, cols):
+        df = with_ce(df, os.path.join(d, name), c)
+    STACK_COLS = [c for c in STACK_COLS if not c.startswith("l_ce")] + cols
+    return df
+
+
+def with_extra(df, split):
+    """ER_STACK_EXTRA=PREFIX: merge PREFIX_{split}.parquet (pair-keyed extra columns) as stacker inputs."""
+    global STACK_COLS
+    prefix = os.environ.get("ER_STACK_EXTRA")
+    if not prefix:
+        return df
+    ex = pd.read_parquet(f"{prefix}_{split}.parquet")
+    cols = [c for c in ex.columns if c not in ("s1_entity_id", "cand_entity_id")]
+    df = df.merge(ex, on=["s1_entity_id", "cand_entity_id"], how="left")
+    assert df[cols[0]].notna().all(), f"pairs missing from {prefix}_{split}.parquet"
+    STACK_COLS = [c for c in STACK_COLS if c not in cols] + cols
     return df
 
 
@@ -77,7 +101,7 @@ def apply(model, df):
     return iso.predict(b.predict(df[STACK_COLS]))
 
 
-KIT_COLS = ["s1_entity_id", "cand_entity_id", "country", "p_lgb"] + [c for c in STACK_COLS if c != "l_ce"]
+KIT_COLS = ["s1_entity_id", "cand_entity_id", "country", "p_lgb"] + [c for c in STACK_COLS if not c.startswith("l_ce")]
 
 
 def base_frame(split, M, kit=None):
@@ -108,7 +132,7 @@ def export_kit(kit, M):
 
 def train(args, M):
     df = base_frame("train", M, args.kit)
-    df = with_ce(df, os.path.join(args.ce_dir, "eval_ce.parquet"))
+    df = with_extra(with_ces(df, args.ce_dir, "eval_ce.parquet"), "train")
     gt = pd.read_parquet(os.path.join(args.kit, "train_ground_truth.parquet")) if args.kit \
         else load_ground_truth()
     truth = {s: {i for i in ids if i} for s, ids in
@@ -134,19 +158,28 @@ def train(args, M):
     model = fit(df)
     path = os.path.join(args.kit or CACHE, "stacker.pkl")
     with open(path, "wb") as fh:
-        pickle.dump(dict(model=model, cv_gain=float(np.mean(stacked) - np.mean(base))), fh)
+        pickle.dump(dict(model=model, cols=list(STACK_COLS), cv_gain=float(np.mean(stacked) - np.mean(base))), fh)
     log(f"wrote {path}")
 
 
 def predict(args, M):
     with open(os.path.join(args.kit or CACHE, "stacker.pkl"), "rb") as fh:
         S = pickle.load(fh)
-    df = with_ce(base_frame("test", M, args.kit), os.path.join(args.ce_dir, "score_ce.parquet"))
+    df = with_extra(with_ces(base_frame("test", M, args.kit), args.ce_dir, "score_ce.parquet"), "test")
+    assert S.get("cols", STACK_COLS) == STACK_COLS, f"stacker was fitted on {S.get('cols')}, got {STACK_COLS}: pass the same --ce-dir list"
     p = apply(S["model"], df)
     if args.ce_countries:
         use = df["country"].isin(args.ce_countries).to_numpy()
         p = np.where(use, p, df["p_lgb"].to_numpy())
         log(f"cross-encoder applied to {use.mean():.1%} of pairs ({', '.join(args.ce_countries)})")
+    # Unlabelled countries: a model is over-confident on a country it never saw. In both unseen-country
+    # simulations (US or India held out) sigmoid(1.4*logit(p) - 1.0) raised that country's F0.5
+    # (+0.0008 / +0.0013) while leaving seen countries flat. ER_UNSEEN_SHIFT="France:1.4:-1.0"
+    for spec in filter(None, os.environ.get("ER_UNSEEN_SHIFT", "").split(",")):
+        c, a, b = spec.split(":")
+        use = (df["country"] == c).to_numpy()
+        p = np.where(use, 1 / (1 + np.exp(-(float(a) * logit(p) + float(b)))), p)
+        log(f"decision shift a={a} b={b} on {use.mean():.1%} of pairs ({c})")
     pairs = df[["s1_entity_id", "cand_entity_id"]]
     accepted = choose(pairs, p, miss_prior=M["miss_prior"], size_penalty=M["size_penalty"])
     s1_ids = (pd.read_parquet(os.path.join(args.kit, "test_s1_ids.parquet")) if args.kit else
@@ -165,7 +198,7 @@ def predict(args, M):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ce-dir", help="dir with eval_ce.parquet / score_ce.parquet")
+    ap.add_argument("--ce-dir", nargs="+", help="dir(s) with eval_ce.parquet / score_ce.parquet; several = ensemble")
     ap.add_argument("--predict", action="store_true")
     ap.add_argument("--outdir", default=OUTPUT)
     ap.add_argument("--ce-countries", nargs="*", default=None)
